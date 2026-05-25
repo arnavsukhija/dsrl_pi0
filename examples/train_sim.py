@@ -19,9 +19,9 @@ import gymnasium as gym
 import gym_aloha
 from gym.spaces import Dict, Box
 
-from libero.libero.libero import benchmark
-from libero.libero.libero import get_libero_path
-from libero.libero.libero.envs import OffScreenRenderEnv
+from libero.libero import benchmark
+from libero.libero import get_libero_path
+from libero.libero.envs import OffScreenRenderEnv
 
 from jaxrl2.data import ReplayBuffer
 from jaxrl2.utils.wandb_logger import WandBLogger, create_exp_name
@@ -126,9 +126,14 @@ class DummyEnv(gym.ObservationWrapper):
                 state_dim = 8
             elif variant.env == 'aloha_cube':
                 state_dim = 14
+            # Append a normalized elapsed-time scalar so the SAC policy can budget remaining switches
+            if getattr(variant, 'switch_cost_wrapper', 0) and getattr(variant, 'time_as_part_of_state', 1):
+                state_dim += 1
             obs_dict['state'] = Box(low=-1.0, high=1.0, shape=(state_dim, 1), dtype=np.float32)
         self.observation_space = Dict(obs_dict)
-        self.action_space = Box(low=-1, high=1, shape=(1, 32,), dtype=np.float32) # 32 is the noise action space of pi 0
+        # In switch-cost mode the agent emits noise + pseudo_time, so action dim grows by 1
+        action_dim = 32 + (1 if getattr(variant, 'switch_cost_wrapper', 0) else 0)
+        self.action_space = Box(low=-1, high=1, shape=(1, action_dim,), dtype=np.float32) # 32 is the noise action space of pi 0
 
 
 def main(variant):

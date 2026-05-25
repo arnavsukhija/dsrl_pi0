@@ -24,10 +24,27 @@ if __name__ == '__main__':
     parser.add_argument('--suffix', default='', help='suffix to use for wandb')
     parser.add_argument('--multi_grad_step', default=1, help='Number of graident steps to take per environment step, aka UTD', type=int)
     parser.add_argument('--resize_image', default=-1, help='the size of image if need resizing', type=int)
-    parser.add_argument('--query_freq', default=-1, help='query frequency', type=int)
+    parser.add_argument('--query_freq', default=-1, help='query frequency (only used when switch_cost_wrapper=0)', type=int)
     parser.add_argument('--libero_suite', default='libero_90', help='LIBERO benchmark suite to use when --env libero.')
     parser.add_argument('--libero_task_id', default=57, help='LIBERO task id within the selected benchmark suite.', type=int)
-    
+
+    # TARC-style adaptive replanning options
+    parser.add_argument('--switch_cost_wrapper', default=0, type=int,
+                        help='If 1, agent emits noise + pseudo_time per decision and pays a switch cost for each pi0 query.')
+    parser.add_argument('--switch_cost', default=0.0, type=float,
+                        help='Constant cost subtracted from the aggregated reward at every pi0 re-query.')
+    parser.add_argument('--min_time_between_switches', default=1, type=int,
+                        help='Minimum number of env steps to consume from a chunk before re-querying pi0.')
+    parser.add_argument('--max_time_between_switches', default=20, type=int,
+                        help='Maximum number of env steps to consume from a chunk before re-querying pi0 (must be <= 50 chunk length).')
+    parser.add_argument('--time_as_part_of_state', default=1, type=int,
+                        help='If 1, append normalized elapsed episode time to the SAC observation state.')
+    parser.add_argument('--eval_mode', default='hybrid',
+                        choices=['hybrid', 'fully_deterministic', 'fully_random'],
+                        help='Eval-time action sampling: hybrid (noise=sample, K=mode), '
+                             'fully_deterministic (both=mode), or fully_random (both=sample). '
+                             'Only affects perform_control_eval_switchcost.')
+
     train_args_dict = dict(
         actor_lr=1e-4,
         critic_lr= 3e-4,
@@ -67,6 +84,7 @@ if __name__ == '__main__':
         num_qs=10,
         action_magnitude=1.0,
         num_cameras=1,
+        pseudo_time_init_bias=0.0,
         explore_until=300000,
         agent_update_period=1,
         expl_agent_update_period=1,

@@ -88,6 +88,48 @@ def obs_to_qpos(obs, variant):
         raise NotImplementedError()
     return qpos
 
+PI0_CHUNK_LEN = 50
+
+
+def _switch_cost_mode(variant) -> bool:
+    return bool(getattr(variant, 'switch_cost_wrapper', 0))
+
+
+def _build_obs_dict(raw_obs, variant, elapsed_steps: int):
+    """Build the SAC observation dict, optionally appending elapsed env-step count.
+
+    Matches TARC convention (`np.concatenate([obs, time])` with `time` as raw elapsed time —
+    physical seconds in TARC's wrappers, env-step count here since LIBERO doesn't expose sim_dt).
+    The actor learns whatever scale it needs.
+    """
+    curr_image = obs_to_img(raw_obs, variant)
+    obs_dict = {'pixels': curr_image[np.newaxis, ..., np.newaxis]}
+    if variant.add_states:
+        qpos = obs_to_qpos(raw_obs, variant).astype(np.float32)
+        if _switch_cost_mode(variant) and getattr(variant, 'time_as_part_of_state', 1):
+            time_feat = np.array([float(elapsed_steps)], dtype=np.float32)
+            qpos = np.concatenate([qpos, time_feat])
+        obs_dict['state'] = qpos[np.newaxis, ..., np.newaxis]
+    return obs_dict, curr_image
+
+
+def _compute_K(pseudo_time: float, k_min: int, k_max: int) -> int:
+    """Map pseudo_time in [-1, 1] -> integer number of env steps in [k_min, k_max]."""
+    pt = float(np.clip(pseudo_time, -1.0, 1.0))
+    raw = (k_max - k_min) / 2.0 * pt + (k_max + k_min) / 2.0
+    k = int(np.floor(raw))
+    return int(np.clip(k, k_min, k_max))
+
+
+def _build_pi0_noise(noise_32: np.ndarray) -> np.ndarray:
+    """Tile the single noise vector to a (1, 50, 32) tensor as pi0 expects."""
+    noise = np.asarray(noise_32).reshape(1, 1, 32)
+    if PI0_CHUNK_LEN > 1:
+        tail = np.repeat(noise, PI0_CHUNK_LEN - 1, axis=1)
+        noise = np.concatenate([noise, tail], axis=1)
+    return noise
+
+
 def trajwise_alternating_training_loop(variant, agent, env, eval_env, online_replay_buffer, replay_buffer, wandb_logger,
                                        perform_control_evals=True, shard_fn=None, agent_dp=None):
     replay_buffer_iterator = replay_buffer.get_iterator(variant.batch_size)
@@ -102,13 +144,27 @@ def trajwise_alternating_training_loop(variant, agent, env, eval_env, online_rep
     
     with tqdm(total=variant.max_steps, initial=0) as pbar:
         while i <= variant.max_steps:
-            traj = collect_traj(variant, agent, env, i, agent_dp)
+            if _switch_cost_mode(variant):
+                traj = collect_traj_switchcost(variant, agent, env, i, agent_dp)
+            else:
+                traj = collect_traj(variant, agent, env, i, agent_dp)
             traj_id = online_replay_buffer._traj_counter
-            add_online_data_to_buffer(variant, traj, online_replay_buffer)
+            if _switch_cost_mode(variant):
+                add_online_data_to_buffer_switchcost(variant, traj, online_replay_buffer)
+            else:
+                add_online_data_to_buffer(variant, traj, online_replay_buffer)
             total_env_steps += traj['env_steps']
             print('online buffer timesteps length:', len(online_replay_buffer))
             print('online buffer num traj:', traj_id + 1)
             print('total env steps:', total_env_steps)
+            if _switch_cost_mode(variant):
+                num_decisions = len(traj['actions'])
+                avg_K = float(np.mean(traj['k_list'])) if num_decisions > 0 else 0.0
+                wandb_logger.log({
+                    'rollout/num_pi0_calls': num_decisions,
+                    'rollout/avg_K_per_decision': avg_K,
+                    'rollout/env_steps_per_episode': traj['env_steps'],
+                }, step=i)
             
             if variant.get("num_online_gradsteps_batch", -1) > 0:
                 num_gradsteps = variant.num_online_gradsteps_batch
@@ -152,7 +208,10 @@ def trajwise_alternating_training_loop(variant, agent, env, eval_env, online_rep
                         wandb_logger.log({'num_online_trajs': traj_id + 1}, step=i)
                         wandb_logger.log({'env_steps': total_env_steps}, step=i)
                         if perform_control_evals:
-                            perform_control_eval(agent, eval_env, i, variant, wandb_logger, agent_dp)
+                            if _switch_cost_mode(variant):
+                                perform_control_eval_switchcost(agent, eval_env, i, variant, wandb_logger, agent_dp)
+                            else:
+                                perform_control_eval(agent, eval_env, i, variant, wandb_logger, agent_dp)
                         if hasattr(agent, 'perform_eval'):
                             agent.perform_eval(variant, i, wandb_logger, replay_buffer, replay_buffer_iterator, eval_env)
 
@@ -344,7 +403,11 @@ def perform_control_eval(agent, env, i, variant, wandb_logger, agent_dp=None):
                     # for initial evaluation, we sample from standard gaussian noise to evaluate the base policy's performance
                     noise = jax.random.normal(rng, (1, 50, 32))
                 else:
-                    if hasattr(agent, 'collecting_exploration'):
+                    # eval_mode controls noise sampling for baseline (no pseudo_time dim here):
+                    #   hybrid / fully_random -> stochastic noise (matches DSRL default)
+                    #   fully_deterministic   -> mode of actor (apples-to-apples with TARC det eval)
+                    eval_mode = getattr(variant, 'eval_mode', 'hybrid')
+                    if hasattr(agent, 'collecting_exploration') or eval_mode == 'fully_deterministic':
                         actions_noise = agent.eval_actions(obs_dict)
                     else:
                         actions_noise = agent.sample_actions(obs_dict)
@@ -396,6 +459,314 @@ def perform_control_eval(agent, env, i, variant, wandb_logger, agent_dp=None):
         summary_str += f'Reward >= {r}: {more_or_equal_r}/{variant.eval_episodes} = {more_or_equal_r_rate*100}%\n'
 
     print(summary_str)
+
+def collect_traj_switchcost(variant, agent, env, i, agent_dp=None):
+    """TARC-style rollout: SAC emits (noise_32, pseudo_time) per decision; we replay K chunk steps.
+
+    At i=0 (before any SAC gradient step) we bypass the random-init actor: noise is sampled from the
+    standard Gaussian that pi0 was trained against, and pseudo_time is sampled uniformly in [-1, 1]
+    so the buffer immediately contains a diverse spread of K values for the critic to learn from.
+    """
+    assert agent_dp is not None
+    max_timesteps = variant.max_timesteps
+    env_max_reward = variant.env_max_reward
+    k_min = int(variant.min_time_between_switches)
+    k_max = int(min(variant.max_time_between_switches, PI0_CHUNK_LEN))
+    assert k_min >= 1 and k_max >= k_min, 'invalid min/max_time_between_switches'
+    switch_cost = float(variant.switch_cost)
+    discount = float(variant.discount)
+    step_penalty = 1.0  # time-scaled DSRL sparse signal: pay 1 per env step still spent before success
+
+    agent._rng, rng = jax.random.split(agent._rng)
+
+    if 'libero' in variant.env:
+        obs = env.reset()
+    elif 'aloha' in variant.env:
+        obs, _ = env.reset()
+
+    obs_list = []
+    action_list = []
+    reward_list = []
+    k_list = []
+    image_list = []
+
+    t_env = 0
+    done = False
+    last_reward = 0.0
+    success_flag = False
+    total_raw_env_reward = 0.0  # raw env reward summed across the whole episode (for logging only)
+
+    obs_dict, _ = _build_obs_dict(obs, variant, t_env)
+
+    while t_env < max_timesteps and not done:
+        rng, key_noise, key_pt = jax.random.split(rng, 3)
+        obs_pi_zero = obs_to_pi_zero_input(obs, variant)
+
+        if i == 0:
+            noise_action = np.asarray(jax.random.normal(key_noise, (32,)), dtype=np.float32)
+            pseudo_time = float(np.asarray(jax.random.uniform(key_pt, (), minval=-1.0, maxval=1.0)))
+        else:
+            sampled = np.asarray(agent.sample_actions(obs_dict)).reshape(-1)
+            assert sampled.shape[0] == 33, f'expected 33-dim action, got {sampled.shape}'
+            noise_action = sampled[:32].astype(np.float32)
+            pseudo_time = float(sampled[32])
+
+        action_33 = np.concatenate([noise_action, np.array([pseudo_time], dtype=np.float32)]).reshape(1, 33)
+
+        noise_full = _build_pi0_noise(noise_action)
+        actions_chunk = agent_dp.infer(obs_pi_zero, noise=noise_full)["actions"]
+
+        K = _compute_K(pseudo_time, k_min, k_max)
+        K = int(min(K, max_timesteps - t_env))
+        if K <= 0:
+            break
+
+        accum_env_reward = 0.0
+        raw_env_reward = 0.0  # for monitoring only — sum of raw env rewards including success step
+        actual_k = 0
+        for step in range(K):
+            action_t = actions_chunk[step]
+            if 'libero' in variant.env:
+                obs, reward, done_step, _ = env.step(action_t)
+            elif 'aloha' in variant.env:
+                obs, reward, term, trunc, _ = env.step(action_t)
+                done_step = term or trunc
+            else:
+                raise NotImplementedError(variant.env)
+            # TARC-style discounted accumulation (zeroed on termination, matches wrappers/ih_switching_cost_gym.py)
+            accum_env_reward += (discount ** step) * (1.0 - float(bool(done_step))) * float(reward)
+            # Raw sum for logging — preserves the LIBERO success reward (which coincides with done=True)
+            raw_env_reward += float(reward)
+            image_list.append(obs_to_img(obs, variant))
+            actual_k += 1
+            last_reward = float(reward)
+            if done_step:
+                done = True
+                break
+
+        if last_reward == env_max_reward:
+            success_flag = True
+
+        total_raw_env_reward += raw_env_reward
+        next_obs_dict, _ = _build_obs_dict(obs, variant, t_env + actual_k)
+
+        obs_list.append(obs_dict)
+        action_list.append(action_33)
+        reward_list.append(accum_env_reward)
+        k_list.append(actual_k)
+
+        obs_dict = next_obs_dict
+        t_env += actual_k
+
+    obs_list.append(obs_dict)  # trailing obs slot, matches add_online_data_to_buffer layout
+
+    num_decisions = len(action_list)
+    if success_flag and num_decisions > 0:
+        rewards_arr = np.array([
+            (-k_list[t] * step_penalty - switch_cost) if t < num_decisions - 1 else (0.0 - switch_cost)
+            for t in range(num_decisions)
+        ], dtype=np.float32)
+        masks_arr = np.concatenate([
+            np.ones(num_decisions - 1, dtype=np.float32),
+            np.zeros(1, dtype=np.float32),
+        ])
+    else:
+        rewards_arr = np.array(
+            [-k_list[t] * step_penalty - switch_cost for t in range(num_decisions)], dtype=np.float32)
+        masks_arr = np.ones(num_decisions, dtype=np.float32)
+
+    discounts_arr = np.array([discount ** k for k in k_list], dtype=np.float32)
+    k_arr = np.array(k_list, dtype=np.int32)
+
+    print(f'Rollout Done: env_steps={t_env}, num_pi0_calls={num_decisions}, '
+          f'avg_K={float(np.mean(k_arr)) if num_decisions > 0 else 0:.2f}, '
+          f'success={success_flag}, switch_cost={switch_cost}')
+
+    return {
+        'observations': obs_list,
+        'actions': action_list,
+        'rewards': rewards_arr,
+        'masks': masks_arr,
+        'discounts': discounts_arr,
+        'k_list': k_arr,
+        'is_success': success_flag,
+        'episode_return': float(total_raw_env_reward),  # raw env reward sum (=1 on success, 0 on failure for LIBERO)
+        'images': image_list,
+        'env_steps': t_env,
+    }
+
+
+def add_online_data_to_buffer_switchcost(variant, traj, online_replay_buffer):
+    actions = traj['actions']
+    episode_len = len(actions)
+    rewards = traj['rewards']
+    masks = traj['masks']
+    discounts = traj['discounts']
+
+    for t in range(episode_len):
+        obs = traj['observations'][t]
+        next_obs = traj['observations'][t + 1]
+        obs = {k: v[0] for k, v in obs.items()}
+        next_obs = {k: v[0] for k, v in next_obs.items()}
+        if not variant.add_states:
+            obs.pop('state', None)
+            next_obs.pop('state', None)
+
+        insert_dict = dict(
+            observations=obs,
+            next_observations=next_obs,
+            actions=actions[t],
+            next_actions=actions[t + 1] if t < episode_len - 1 else actions[t],
+            rewards=float(rewards[t]),
+            masks=float(masks[t]),
+            discount=float(discounts[t]),
+        )
+        online_replay_buffer.insert(insert_dict)
+    online_replay_buffer.increment_traj_counter()
+
+
+def perform_control_eval_switchcost(agent, env, i, variant, wandb_logger, agent_dp=None):
+    assert agent_dp is not None
+    max_timesteps = variant.max_timesteps
+    env_max_reward = variant.env_max_reward
+    k_min = int(variant.min_time_between_switches)
+    k_max = int(min(variant.max_time_between_switches, PI0_CHUNK_LEN))
+
+    episode_returns = []
+    highest_rewards = []
+    success_rates = []
+    episode_lens = []
+    num_pi0_calls_list = []
+    avg_K_list = []
+    k_std_list = []
+    k_min_list = []
+    k_max_list = []
+    k_traces = []  # list[list[int]] — one inner list of K's per rollout
+
+    rng = jax.random.PRNGKey(variant.seed + 456)
+
+    for rollout_id in range(variant.eval_episodes):
+        if 'libero' in variant.env:
+            obs = env.reset()
+        elif 'aloha' in variant.env:
+            obs, _ = env.reset()
+
+        image_list = []
+        rewards = []
+        k_list = []
+
+        t_env = 0
+        done = False
+        last_reward = 0.0
+        obs_dict, _ = _build_obs_dict(obs, variant, t_env)
+
+        while t_env < max_timesteps and not done:
+            rng, key_noise, key_pt = jax.random.split(rng, 3)
+            obs_pi_zero = obs_to_pi_zero_input(obs, variant)
+
+            if i == 0:
+                noise_action = np.asarray(jax.random.normal(key_noise, (32,)), dtype=np.float32)
+                pseudo_time = float(np.asarray(jax.random.uniform(key_pt, (), minval=-1.0, maxval=1.0)))
+            else:
+                # Eval policy variants (set by --eval_mode CLI flag):
+                #   hybrid              : noise = sample, K = mode    (default, principled)
+                #   fully_deterministic : noise = mode,   K = mode    (everything deterministic)
+                #   fully_random        : noise = sample, K = sample  (original buggy mode, for ablation)
+                eval_mode = getattr(variant, 'eval_mode', 'hybrid')
+                if eval_mode == 'fully_deterministic':
+                    det = np.asarray(agent.eval_actions(obs_dict)).reshape(-1)
+                    noise_action = det[:32].astype(np.float32)
+                    pseudo_time = float(det[32])
+                elif eval_mode == 'fully_random':
+                    stoch = np.asarray(agent.sample_actions(obs_dict)).reshape(-1)
+                    noise_action = stoch[:32].astype(np.float32)
+                    pseudo_time = float(stoch[32])
+                else:  # hybrid
+                    stoch = np.asarray(agent.sample_actions(obs_dict)).reshape(-1)
+                    det = np.asarray(agent.eval_actions(obs_dict)).reshape(-1)
+                    noise_action = stoch[:32].astype(np.float32)
+                    pseudo_time = float(det[32])
+
+            noise_full = _build_pi0_noise(noise_action)
+            actions_chunk = agent_dp.infer(obs_pi_zero, noise=noise_full)["actions"]
+
+            K = _compute_K(pseudo_time, k_min, k_max)
+            K = int(min(K, max_timesteps - t_env))
+            if K <= 0:
+                break
+
+            actual_k = 0
+            for step in range(K):
+                action_t = actions_chunk[step]
+                if 'libero' in variant.env:
+                    obs, reward, done_step, _ = env.step(action_t)
+                elif 'aloha' in variant.env:
+                    obs, reward, term, trunc, _ = env.step(action_t)
+                    done_step = term or trunc
+                rewards.append(reward)
+                image_list.append(obs_to_img(obs, variant))
+                t_env += 1
+                actual_k += 1
+                last_reward = float(reward)
+                if done_step:
+                    done = True
+                    break
+
+            k_list.append(actual_k)
+            obs_dict, _ = _build_obs_dict(obs, variant, t_env)
+
+        episode_lens.append(t_env)
+        rewards_arr = np.array(rewards)
+        episode_returns.append(float(np.sum(rewards_arr)))
+        highest_rewards.append(float(np.max(rewards_arr)) if rewards_arr.size > 0 else 0.0)
+        is_success = (last_reward == env_max_reward)
+        success_rates.append(is_success)
+        num_pi0_calls_list.append(len(k_list))
+        if k_list:
+            k_arr = np.array(k_list, dtype=np.int32)
+            avg_K_list.append(float(k_arr.mean()))
+            k_std_list.append(float(k_arr.std()))
+            k_min_list.append(int(k_arr.min()))
+            k_max_list.append(int(k_arr.max()))
+        else:
+            avg_K_list.append(0.0)
+            k_std_list.append(0.0)
+            k_min_list.append(0)
+            k_max_list.append(0)
+        k_traces.append(list(k_list))
+
+        print(f'[eval {rollout_id}] env_steps={t_env}, pi0_calls={len(k_list)}, '
+              f'avg_K={avg_K_list[-1]:.2f}, K_std={k_std_list[-1]:.2f}, '
+              f'K_range=[{k_min_list[-1]},{k_max_list[-1]}], success={is_success}')
+
+        if image_list:
+            video = np.stack(image_list).transpose(0, 3, 1, 2)
+            wandb_logger.log({f'eval_video/{rollout_id}': wandb.Video(video, fps=50)}, step=i)
+
+    success_rate = float(np.mean(success_rates))
+    wandb_logger.log({
+        'evaluation/avg_return': float(np.mean(episode_returns)),
+        'evaluation/success_rate': success_rate,
+        'evaluation/avg_episode_len': float(np.mean(episode_lens)),
+        'evaluation/avg_num_pi0_calls': float(np.mean(num_pi0_calls_list)),
+        'evaluation/avg_K_per_decision': float(np.mean(avg_K_list)),
+        'evaluation/avg_K_std_within_episode': float(np.mean(k_std_list)),
+        'evaluation/avg_K_min_within_episode': float(np.mean(k_min_list)),
+        'evaluation/avg_K_max_within_episode': float(np.mean(k_max_list)),
+    }, step=i)
+    # Per-rollout K traces (long-form table so we can plot K vs decision_idx grouped by rollout)
+    k_trace_table = wandb.Table(columns=["rollout_id", "decision_idx", "K"])
+    for rid, trace in enumerate(k_traces):
+        for d_idx, k_val in enumerate(trace):
+            k_trace_table.add_data(rid, d_idx, int(k_val))
+    wandb_logger.log({'evaluation/K_traces': k_trace_table}, step=i)
+    for r in range(env_max_reward + 1):
+        more_or_equal_r = (np.array(highest_rewards) >= r).sum()
+        wandb_logger.log({f'evaluation/Reward >= {r}': more_or_equal_r / variant.eval_episodes}, step=i)
+    print(f'\n[switchcost eval] success_rate={success_rate}, '
+          f'avg_pi0_calls={np.mean(num_pi0_calls_list):.2f}, avg_K={np.mean(avg_K_list):.2f}, '
+          f'avg_K_std={np.mean(k_std_list):.2f}\n')
+
 
 def make_multiple_value_reward_visulizations(agent, variant, i, replay_buffer, wandb_logger):
     trajs = replay_buffer.get_random_trajs(3)
