@@ -1,30 +1,22 @@
 <div align="center">
 
-# DSRL for π₀: Diffusion Steering via Reinforcement Learning
+# TARC for DSRL-π₀: Time-Adaptive Replanning for Steered Diffusion Policies
 
-## [[website](https://diffusion-steering.github.io)]      [[paper](https://arxiv.org/abs/2506.15799)]
+## [[website](https://arnavsukhija.github.io/projects/tarc/)]      [[paper](https://arxiv.org/abs/2510.23176)]      [[TARC main repo](https://github.com/arnavsukhija/TARC)]
 
 </div>
 
-
 ## Overview
-This repository provides the official implementation for our paper: [Steering Your Diffusion Policy with Latent Space Reinforcement Learning](https://arxiv.org/abs/2506.15799) (CoRL 2025).
+This repository applies **TARC (Time-Adaptive Robotic Control)** to a pre-trained generalist policy, [π₀](https://github.com/Physical-Intelligence/openpi), steered with **DSRL** (Diffusion Steering via Reinforcement Learning). It is the π₀ / LIBERO experiment of the TARC paper, and is included as a submodule of the [TARC repository](https://github.com/arnavsukhija/TARC).
 
-Specifically, it contains a JAX-based implementation of DSRL (Diffusion Steering via Reinforcement Learning) for steering a pre-trained generalist policy, [π₀](https://github.com/Physical-Intelligence/openpi), across various environments, including:
+π₀ predicts an action chunk (up to 50 steps), and DSRL learns a latent-noise policy that steers it. Standard DSRL re-queries π₀ at a fixed interval (`--query_freq`). TARC instead lets the RL agent choose, at every decision, **both the steering noise and how many steps of the chunk to execute before re-querying π₀**. Each re-query pays a switching cost, so the agent only replans when it is worth the expensive π₀ forward pass.
 
-- **Simulation:** Libero, Aloha  
-- **Real Robot:** Franka
+| Mode | Flags | Behaviour |
+|---|---|---|
+| DSRL baseline | `--switch_cost_wrapper 0 --query_freq K` | Re-query π₀ every `K` steps |
+| TARC | `--switch_cost_wrapper 1 --switch_cost c --min_time_between_switches a --max_time_between_switches b` | Agent outputs noise and a replanning time in `[a, b]`; every re-query costs `c` |
 
-If you find this repository useful for your research, please cite:
-
-```
-@article{wagenmaker2025steering,
-  author    = {Andrew Wagenmaker and Mitsuhiko Nakamoto and Yunchu Zhang and Seohong Park and Waleed Yagoub and Anusha Nagabandi and Abhishek Gupta and Sergey Levine},
-  title     = {Steering Your Diffusion Policy with Latent Space Reinforcement Learning},
-  journal   = {Conference on Robot Learning (CoRL)},
-  year      = {2025},
-}
-```
+This code builds on the [original DSRL implementation](https://github.com/ajwagen/dsrl_pi0) (Wagenmaker et al., CoRL 2025), which in turn builds on [jaxrl2](https://github.com/ikostrikov/jaxrl2) and [PTR](https://github.com/Asap7772/PTR). Supported environments are LIBERO and Aloha in simulation, plus a Franka real-robot setup.
 
 ## Installation
 1. Create a conda environment:
@@ -33,9 +25,9 @@ conda create -n dsrl_pi0 python=3.11.11
 conda activate dsrl_pi0
 ```
 
-2. Clone this repo with all submodules
+2. Clone this repo with all submodules (or, from within the TARC repo, run `git submodule update --init --recursive`)
 ```
-git clone git@github.com:klemensiten/dsrl_pi0.git --recurse-submodules
+git clone git@github.com:arnavsukhija/dsrl_pi0.git --recurse-submodules
 cd dsrl_pi0
 ```
 
@@ -59,17 +51,34 @@ find . \( -name '*.py' -o -name '*.sh' -o -name '*.yaml' -o -name '*.yml' -o -na
   -exec perl -pi -e 's/libero\.libero(?!\.libero)/libero.libero.libero/g' {} +
 ```
 
+No GPU? See [Running LIBERO on a CPU-only machine](#running-libero-on-a-cpu-only-machine-no-gpu) below.
+
 ## Training (Simulation)
-Libero
+
+**TARC on LIBERO** (adaptive replanning):
 ```
-bash examples/scripts/run_libero.sh
+SWITCH_COST=20 MIN_K=5 MAX_K=50 SEED=0 bash examples/scripts/run_libero_tarc.sh
 ```
-Aloha
+
+**DSRL baseline on LIBERO** (fixed query frequency):
 ```
-bash examples/scripts/run_aloha.sh
+QUERY_FREQ=20 SEED=0 bash examples/scripts/run_libero_baseline.sh
 ```
+
+Both scripts read `TASK_ID` (default 57, the LIBERO-90 task) and log to Weights & Biases. Other entry points:
+
+| Script | Purpose |
+|---|---|
+| `run_libero.sh`, `run_aloha.sh` | Original DSRL on LIBERO / Aloha |
+| `run_libero_ablation.sh` | TARC ablation (evaluation mode, pseudo-time init bias, `K` range) |
+| `submit_libero_tarc_sweep.sh`, `submit_libero_baseline_sweep.sh`, `submit_libero_ablation_sweep.sh` | Slurm sweeps (ETH Euler). Use `DRY=1` to print the `sbatch` commands only |
+| `submit_libero_new_tasks.sh` | TARC and baselines on additional LIBERO-90 tasks (multi-task result) |
+| `smoke_libero_tarc.sh` | Quick smoke test |
+
+Plots for the paper are generated from the W&B runs by the scripts in `plotting/dsrl_pi0/` of the TARC repo.
+
 ### Training Logs
-We provide sample W&B runs and logs: https://wandb.ai/mitsuhiko/DSRL_pi0_public
+Sample W&B runs from the original DSRL release: https://wandb.ai/mitsuhiko/DSRL_pi0_public
 
 ## Training (Real)
 For real-world experiments, we use the remote hosting feature from pi0 (see [here](https://github.com/Physical-Intelligence/openpi/blob/main/docs/remote_inference.md)) which enables us to host the pi0 model on a higher-spec remote server, in case the robot's client machine is not powerful enough. 
@@ -85,19 +94,39 @@ cd openpi && python scripts/serve_policy.py --env=DROID
 bash examples/scripts/run_real.sh
 ```
 
+## Citation
+If you use this code, please cite both TARC and DSRL:
+
+```bibtex
+@misc{sukhija2026tarctimeadaptiveroboticcontrol,
+      title={TARC: Time-Adaptive Robotic Control}, 
+      author={Arnav Sukhija and Lenart Treven and Jin Cheng and Florian Dörfler and Stelian Coros and Andreas Krause},
+      year={2026},
+      eprint={2510.23176},
+      archivePrefix={arXiv},
+      primaryClass={cs.RO},
+      url={https://arxiv.org/abs/2510.23176}, 
+}
+
+@article{wagenmaker2025steering,
+  author    = {Andrew Wagenmaker and Mitsuhiko Nakamoto and Yunchu Zhang and Seohong Park and Waleed Yagoub and Anusha Nagabandi and Abhishek Gupta and Sergey Levine},
+  title     = {Steering Your Diffusion Policy with Latent Space Reinforcement Learning},
+  journal   = {Conference on Robot Learning (CoRL)},
+  year      = {2025},
+}
+```
 
 ## Credits
-This repository is built upon [jaxrl2](https://github.com/ikostrikov/jaxrl2) and [PTR](https://github.com/Asap7772/PTR) repositories. 
-In case of any questions, bugs, suggestions or improvements, please feel free to contact me at nakamoto\[at\]berkeley\[dot\]edu 
+Built on the [DSRL](https://github.com/ajwagen/dsrl_pi0) codebase by Wagenmaker, Nakamoto et al., which uses [jaxrl2](https://github.com/ikostrikov/jaxrl2) and [PTR](https://github.com/Asap7772/PTR). Some of the early adaptive-chunking and explorer-learner work in this repository's history is by Klemens Iten. TARC-specific changes are by Arnav Sukhija.
 
 
-# Running LIBERO on a CPU-only machine (no GPU)
+## Running LIBERO on a CPU-only machine (no GPU)
 
 This documents the setup/debugging steps needed to run the LIBERO experiments in `dsrl_pi0` on a machine without a CUDA-capable GPU.
 
 ---
 
-## 1. Create a clean Conda environment
+### 1. Create a clean Conda environment
 
 A broken / contaminated Conda environment caused issues initially (ROS packages leaking in, missing Python binary).
 
@@ -124,7 +153,7 @@ Expected:
 
 ---
 
-## 2. Install project dependencies
+### 2. Install project dependencies
 
 From repo root:
 
@@ -137,7 +166,7 @@ pip install "jax[cpu]==0.5.0"
 
 ---
 
-## 3. Fix LIBERO import path
+### 3. Fix LIBERO import path
 
 LIBERO package structure requires adding the local `LIBERO/` directory to `PYTHONPATH`.
 
@@ -157,7 +186,7 @@ fail.
 
 ---
 
-## 4. Install LIBERO editable
+### 4. Install LIBERO editable
 
 ```bash
 cd ~/git/dsrl_pi0/LIBERO
@@ -167,7 +196,7 @@ cd ..
 
 ---
 
-## 5. CPU-only rendering setup (important)
+### 5. CPU-only rendering setup (important)
 
 Default script assumed EGL / GPU rendering:
 
@@ -177,7 +206,7 @@ MUJOCO_GL=egl
 
 This fails on machines without GPU support.
 
-### Use OSMesa instead
+#### Use OSMesa instead
 
 ```bash
 unset CUDA_VISIBLE_DEVICES
@@ -189,7 +218,7 @@ export PYOPENGL_PLATFORM=osmesa
 
 ---
 
-## 6. Install OSMesa / Mesa dependencies
+### 6. Install OSMesa / Mesa dependencies
 
 Needed for CPU offscreen rendering:
 
@@ -202,7 +231,7 @@ sudo apt install \
     libglu1-mesa-dev
 ```
 
-## 7. Required environment variables for launch
+### 7. Required environment variables for launch
 
 From repo root:
 
@@ -222,7 +251,7 @@ mkdir -p "$EXP"
 
 ---
 
-## 8. Launch training manually
+### 8. Launch training manually
 
 ```bash
 python -m examples.launch_train_sim \
@@ -247,7 +276,7 @@ python -m examples.launch_train_sim \
 
 ---
 
-## 11. Recommended fixes for `examples/scripts/run_libero.sh`
+### 11. Recommended fixes for `examples/scripts/run_libero.sh`
 
 Update script to include:
 
@@ -279,7 +308,7 @@ python3 examples/launch_train_sim.py
 
 ---
 
-## 12. Remaining note: LIBERO datasets
+### 12. Remaining note: LIBERO datasets
 
 Warning observed:
 
