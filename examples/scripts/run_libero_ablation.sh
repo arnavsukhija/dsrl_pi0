@@ -27,6 +27,7 @@ SWITCH_COST=${SWITCH_COST:-20}
 MIN_K=${MIN_K:-1}
 MAX_K=${MAX_K:-50}
 SEED=${SEED:-0}
+TASK_ID=${TASK_ID:-57}
 
 # --- Euler-specific bootstrap (no-op when running locally) ---
 if [ -n "${SLURM_JOB_ID:-}" ]; then
@@ -58,7 +59,7 @@ fi
 mkdir -p "$EXP"
 
 # Build a descriptive suffix so the W&B run name encodes the ablation cell.
-SUFFIX="sc${SWITCH_COST}_K${MIN_K}-${MAX_K}_eval-${EVAL_MODE}_bias${BIAS}"
+SUFFIX="task${TASK_ID}_sc${SWITCH_COST}_K${MIN_K}-${MAX_K}_eval-${EVAL_MODE}_bias${BIAS}"
 
 python -m examples.launch_train_sim \
   --algorithm pixel_sac \
@@ -84,4 +85,5 @@ python -m examples.launch_train_sim \
   --max_time_between_switches ${MAX_K} \
   --time_as_part_of_state 1 \
   --eval_mode ${EVAL_MODE} \
-  --pseudo_time_init_bias ${BIAS}
+  --pseudo_time_init_bias ${BIAS} \
+  --libero_task_id ${TASK_ID}

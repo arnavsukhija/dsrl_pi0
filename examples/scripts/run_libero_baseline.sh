@@ -22,6 +22,7 @@ SEED=${SEED:-0}
 # Eval mode: hybrid (DSRL default, stochastic noise) or fully_deterministic (apples-to-apples vs TARC det eval).
 # For baselines fully_random == hybrid (no pseudo_time dim to randomize).
 EVAL_MODE=${EVAL_MODE:-hybrid}
+TASK_ID=${TASK_ID:-57}
 
 # --- Euler-specific bootstrap (no-op when running locally) ---
 if [ -n "${SLURM_JOB_ID:-}" ]; then
@@ -56,7 +57,7 @@ python -m examples.launch_train_sim \
   --algorithm pixel_sac \
   --env libero \
   --prefix dsrl_pi0_libero_baseline \
-  --suffix "qf${QUERY_FREQ}_eval-${EVAL_MODE}" \
+  --suffix "task${TASK_ID}_qf${QUERY_FREQ}_eval-${EVAL_MODE}" \
   --wandb_project ${proj_name} \
   --batch_size 256 \
   --discount 0.999 \
@@ -72,4 +73,5 @@ python -m examples.launch_train_sim \
   --hidden_dims 128 \
   --query_freq ${QUERY_FREQ} \
   --switch_cost_wrapper 0 \
-  --eval_mode ${EVAL_MODE}
+  --eval_mode ${EVAL_MODE} \
+  --libero_task_id ${TASK_ID}
